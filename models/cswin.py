@@ -64,16 +64,16 @@ class LePEAttention(nn.Module):
         self.dim = dim
         self.dim_out = dim_out or dim
         self.resolution = resolution
-        self.split_size = split_size
+        self.split_size = split_size  # sw
         self.num_heads = num_heads
         head_dim = dim // num_heads
         # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
         self.scale = qk_scale or head_dim ** -0.5
-        if idx == -1:
+        if idx == -1:  # global attenton
             H_sp, W_sp = self.resolution, self.resolution
-        elif idx == 0:
+        elif idx == 0:  # row attention
             H_sp, W_sp = self.resolution, self.split_size
-        elif idx == 1:
+        elif idx == 1:  # column attention
             W_sp, H_sp = self.resolution, self.split_size
         else:
             print ("ERROR MODE", idx)
@@ -81,15 +81,17 @@ class LePEAttention(nn.Module):
         self.H_sp = H_sp
         self.W_sp = W_sp
         stride = 1
-        self.get_v = nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1,groups=dim)
+        self.get_v = nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1,groups=dim)  # 深度可分离卷积
 
         self.attn_drop = nn.Dropout(attn_drop)
 
     def im2cswin(self, x):
         B, N, C = x.shape
         H = W = int(np.sqrt(N))
+        # (B, N, C) -> (B, C, N) -> (B, C, H, W)
         x = x.transpose(-2,-1).contiguous().view(B, C, H, W)
-        x = img2windows(x, self.H_sp, self.W_sp)
+        x = img2windows(x, self.H_sp, self.W_sp)  # (B*(H//h_sp, W//w_sp), h_sp * w_sp, C)
+        # (B*(H//h_sp, W//w_sp), h_sp * w_sp, C) -> (B*(H//h_sp, W//w_sp), h_sp*w_sp, h, C//h) -> (B*(H//h_sp, W//w_sp),h, h_sp*w_sp, C//h)
         x = x.reshape(-1, self.H_sp* self.W_sp, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3).contiguous()
         return x
 
@@ -102,9 +104,10 @@ class LePEAttention(nn.Module):
         x = x.view(B, C, H // H_sp, H_sp, W // W_sp, W_sp)
         x = x.permute(0, 2, 4, 1, 3, 5).contiguous().reshape(-1, C, H_sp, W_sp) ### B', C, H', W'
 
-        lepe = func(x) ### B', C, H', W'
-        lepe = lepe.reshape(-1, self.num_heads, C // self.num_heads, H_sp * W_sp).permute(0, 1, 3, 2).contiguous()
+        lepe = func(x) ### B', C, H', W'   dw conv
 
+        # (B', C, H', W') -> (B, h, C//h, h_sp * w_sp) -> (B, h, h_sp*w_sp, C//h)
+        lepe = lepe.reshape(-1, self.num_heads, C // self.num_heads, H_sp * W_sp).permute(0, 1, 3, 2).contiguous()
         x = x.reshape(-1, self.num_heads, C // self.num_heads, self.H_sp* self.W_sp).permute(0, 1, 3, 2).contiguous()
         return x, lepe
 
@@ -147,18 +150,19 @@ class CSWinBlock(nn.Module):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
-        self.patches_resolution = reso
-        self.split_size = split_size
+        self.patches_resolution = reso  # 当前输入的分辨率
+        self.split_size = split_size  # sw
         self.mlp_ratio = mlp_ratio
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.norm1 = norm_layer(dim)
 
+        # 对于最后一个stage，由于输入为已经为7x7（输入图像为224x224），sw也是7，那么其实只有一个window，就等于在做global attention，也就没必要再分成两组了
         if self.patches_resolution == split_size:
             last_stage = True
-        if last_stage:
-            self.branch_num = 1
+        if last_stage:  # 最后一个阶段，实际上执行的是global attention
+            self.branch_num = 1  # 只有一个分支
         else:
-            self.branch_num = 2
+            self.branch_num = 2  # 两个分支，分别执行水平和垂直attention
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(drop)
         
@@ -196,8 +200,8 @@ class CSWinBlock(nn.Module):
         qkv = self.qkv(img).reshape(B, -1, 3, C).permute(2, 0, 1, 3)
         
         if self.branch_num == 2:
-            x1 = self.attns[0](qkv[:,:,:,:C//2])
-            x2 = self.attns[1](qkv[:,:,:,C//2:])
+            x1 = self.attns[0](qkv[:,:,:,:C//2])  # 一半heads执行水平attention
+            x2 = self.attns[1](qkv[:,:,:,C//2:])  # 另外一半heads执行竖直attention
             attened_x = torch.cat([x1,x2], dim=2)
         else:
             attened_x = self.attns[0](qkv)
@@ -207,13 +211,15 @@ class CSWinBlock(nn.Module):
 
         return x
 
+# 对于水平attention，H_sp=sw, W_sp=W
+# 对于竖直attention，H_sp=H, W_sp=sw
 def img2windows(img, H_sp, W_sp):
     """
     img: B C H W
     """
     B, C, H, W = img.shape
     img_reshape = img.view(B, C, H // H_sp, H_sp, W // W_sp, W_sp)
-    img_perm = img_reshape.permute(0, 2, 4, 3, 5, 1).contiguous().reshape(-1, H_sp* W_sp, C)
+    img_perm = img_reshape.permute(0, 2, 4, 3, 5, 1).contiguous().reshape(-1, H_sp* W_sp, C)  # H_sp* W_sp 表示一个窗口的大小
     return img_perm
 
 def windows2img(img_splits_hw, H_sp, W_sp, H, W):
@@ -224,7 +230,7 @@ def windows2img(img_splits_hw, H_sp, W_sp, H, W):
 
     img = img_splits_hw.view(B, H // H_sp, W // W_sp, H_sp, W_sp, -1)
     img = img.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
-    return img
+    return img  # (B, C, H, W)
 
 class Merge_Block(nn.Module):
     def __init__(self, dim, dim_out, norm_layer=nn.LayerNorm):
@@ -250,7 +256,7 @@ class CSWinTransformer(nn.Module):
                  num_heads=12, mlp_ratio=4., qkv_bias=True, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm, use_chk=False):
         super().__init__()
-        self.use_chk = use_chk
+        self.use_chk = use_chk  # chk -> checkpoint
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         heads=num_heads
@@ -415,4 +421,11 @@ def CSWin_144_24322_large_384(pretrained=False, **kwargs):
         split_size=[1,2,12,12], num_heads=[6,12,24,24], mlp_ratio=4., **kwargs)
     model.default_cfg = default_cfgs['cswin_384']
     return model
+
+if __name__ == '__main__':
+    net = CSWin_64_12211_tiny_224()
+    dummy_x = torch.randn(1, 3, 224, 224)
+    logits = net(dummy_x)  # (1,3)
+    print(net)
+    print(logits)
 
